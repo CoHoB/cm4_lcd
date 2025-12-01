@@ -1,0 +1,69 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&gpu>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/soc/firmwarekms@7e600000";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@2 {
+		target-path = "/soc/hvs@7e400000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target-path = "/soc/pixelvalve@7e206000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@4 {
+		target-path = "/soc/pixelvalve@7e207000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@5 {
+		target-path = "/soc/pixelvalve@7e20a000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@6 {
+		target-path = "/soc/pixelvalve@7e216000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@7 {
+		target-path = "/soc/pixelvalve@7ec12000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@8 {
+		target-path = "/soc/txp@7e004000";
+		__overlay__ {
+			status = "okay";
+		};
+	};
+};

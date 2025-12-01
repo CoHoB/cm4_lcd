@@ -1,0 +1,924 @@
+From 062fa039a748093594119a6c6d234320a342c68b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Andr=C3=A9?= <andre@cohob.de>
+Date: Tue, 2 Dec 2025 14:59:54 +0100
+Subject: [PATCH] Integration EK79007-Display
+
+---
+ drivers/gpu/drm/panel/Kconfig            |   9 +
+ drivers/gpu/drm/panel/Makefile           |   2 +
+ drivers/gpu/drm/panel/panel-ek79007ad3.c | 562 +++++++++++++++++++++++
+ drivers/gpu/drm/vc4/vc4_drv.c            |  28 +-
+ drivers/gpu/drm/vc4/vc4_dsi.c            | 137 +++++-
+ 5 files changed, 720 insertions(+), 18 deletions(-)
+ create mode 100644 drivers/gpu/drm/panel/panel-ek79007ad3.c
+
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index 928b9f1bf7d5..254b945d7449 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -1030,4 +1030,13 @@ config DRM_PANEL_XINPENG_XPP055C272
+ 	  Say Y here if you want to enable support for the Xinpeng
+ 	  XPP055C272 controller for 720x1280 LCD panels with MIPI/RGB/SPI
+ 	  system interfaces.
++
++config DRM_PANEL_EK79007AD3
++    tristate "EK79007AD3 MIPI DSI panel"
++    depends on OF
++    depends on DRM_MIPI_DSI
++    help
++      Say Y here if you want to enable support for the EK79007AD3
++      MIPI DSI panel.
++
+ endmenu
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index c13a08111d0c..f5fd0d89381e 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -104,3 +104,5 @@ obj-$(CONFIG_DRM_PANEL_WAVESHARE_TOUCHSCREEN) += panel-waveshare-dsi.o
+ obj-$(CONFIG_DRM_PANEL_WAVESHARE_TOUCHSCREEN_V2) += panel-waveshare-dsi-v2.o
+ obj-$(CONFIG_DRM_PANEL_WIDECHIPS_WS2401) += panel-widechips-ws2401.o
+ obj-$(CONFIG_DRM_PANEL_XINPENG_XPP055C272) += panel-xinpeng-xpp055c272.o
++obj-$(CONFIG_DRM_PANEL_EK79007AD3) += panel-ek79007ad3.o
++
+diff --git a/drivers/gpu/drm/panel/panel-ek79007ad3.c b/drivers/gpu/drm/panel/panel-ek79007ad3.c
+new file mode 100644
+index 000000000000..4e4030680796
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-ek79007ad3.c
+@@ -0,0 +1,562 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * DRM panel driver for EK79007AD3-based displays
++ * FN0700D086A 7" 1024x600 DSI panel
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regulator/consumer.h>
++
++#include <video/mipi_display.h>
++
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_bridge.h>
++
++#include <media/v4l2-mediabus.h>
++
++struct ek79007ad3_panel {
++	struct drm_panel panel;
++	struct mipi_dsi_device *dsi;
++	struct gpio_desc *reset_gpio;
++	struct gpio_desc *enable_gpio;
++	struct drm_bridge *bridge;
++	bool prepared;
++	bool enabled;
++	bool init_sent;
++	/* Count how many times prepare() was called; skip the first attempt */
++	int prepare_count;
++};
++
++static int ek79007ad3_send_init_sequence(struct ek79007ad3_panel *ctx);
++
++static inline struct ek79007ad3_panel *to_ek79007ad3_panel(struct drm_panel *panel)
++{
++	return container_of(panel, struct ek79007ad3_panel, panel);
++}
++
++static int ek79007ad3_panel_prepare(struct drm_panel *panel)
++{
++	struct ek79007ad3_panel *ctx = to_ek79007ad3_panel(panel);
++	struct device *dev = &ctx->dsi->dev;
++	int ret;
++
++	/* DON'T check ctx->prepared - allow multiple calls!
++	 * This will be called twice:
++	 * 1. By DRM core (DSI not ready yet, will timeout)
++	 * 2. By VC4 callback (DSI ready, will succeed)
++	 * Use init_sent to ensure init only succeeds once. */
++
++	dev_info(dev, "Panel prepare called (init_sent=%d)\n", ctx->init_sent);
++	/* If this is the very first prepare() call, skip it immediately.
++	 * On some systems DRM calls prepare() early before the DSI host
++	 * is fully initialized; the first attempt almost always times out.
++	 * Skip once and return -EPROBE_DEFER so the later VC4 callback
++	 * will call prepare() again when the host is ready. */
++	if (ctx->prepare_count == 0) {
++		ctx->prepare_count++;
++		dev_info(dev, "First prepare() detected - skipping initial attempt to avoid timeouts\n");
++		return -EPROBE_DEFER;
++	}
++
++	if (ctx->init_sent) {
++		dev_info(dev, "Skipping prepare (init_sent=%d, prepared=%d)\n",
++			ctx->init_sent, ctx->prepared);
++		ctx->prepared = true;
++		return 0;
++	}
++
++	dev_info(dev, "Attempting init sequence\n");
++	ret = ek79007ad3_send_init_sequence(ctx);
++	if (ret < 0) {
++		dev_warn(dev, "Init failed: %d (DSI not ready yet, will retry on next prepare)\n", ret);
++		/* Return -EPROBE_DEFER to tell DRM to retry later when DSI is ready */
++		return -EPROBE_DEFER;
++	}
++
++	/* Init succeeded - perform safe DCS readback while still in LP mode
++	 * Reads performed here avoid switching to HS/video mode where
++	 * read transactions can fail with -110 (timeouts) on some hardware.
++	 */
++	{
++		u8 read_val[4];
++		int r;
++
++		r = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_POWER_MODE, read_val, 1);
++		if (r < 0)
++			dev_warn(dev, "Failed to read power mode during prepare: %d\n", r);
++		else
++			dev_info(dev, "Power Mode (prepare): 0x%02X\n", read_val[0]);
++
++		r = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_DISPLAY_MODE, read_val, 1);
++		if (r < 0)
++			dev_warn(dev, "Failed to read display mode during prepare: %d\n", r);
++		else
++			dev_info(dev, "Display Mode (prepare): 0x%02X\n", read_val[0]);
++
++		r = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_SIGNAL_MODE, read_val, 1);
++		if (r < 0)
++			dev_warn(dev, "Failed to read signal mode during prepare: %d\n", r);
++		else
++			dev_info(dev, "Signal Mode (prepare): 0x%02X\n", read_val[0]);
++
++		r = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_PIXEL_FORMAT, read_val, 1);
++		if (r < 0)
++			dev_warn(dev, "Failed to read pixel format during prepare: %d\n", r);
++		else
++			dev_info(dev, "Pixel Format (prepare): 0x%02X\n", read_val[0]);
++	}
++
++	/* Additionally send Exit Sleep, set pixel format and Display ON while still
++	 * in LP mode so we can read the active register values before HS/video
++	 * mode is enabled by the VC4 bridge. These transfers must be in LP.
++	 */
++	{
++		u8 cmd_buf[2];
++		int r;
++		struct mipi_dsi_msg msg = {0};
++
++		msg.channel = ctx->dsi->channel;
++		msg.flags = MIPI_DSI_MSG_USE_LPM;
++
++		/* Exit Sleep Mode */
++		msg.type = MIPI_DSI_DCS_SHORT_WRITE;
++		cmd_buf[0] = MIPI_DCS_EXIT_SLEEP_MODE;
++		msg.tx_buf = cmd_buf;
++		msg.tx_len = 1;
++		r = ctx->dsi->host->ops->transfer(ctx->dsi->host, &msg);
++		if (r < 0)
++			dev_warn(dev, "Failed to exit sleep mode (prepare): %d\n", r);
++		else
++			dev_info(dev, "Exit sleep mode sent (prepare)\n");
++		msleep(120);
++
++		/* Set Pixel Format to RGB888 */
++		msg.type = MIPI_DSI_DCS_SHORT_WRITE_PARAM;
++		cmd_buf[0] = MIPI_DCS_SET_PIXEL_FORMAT;
++		cmd_buf[1] = MIPI_DCS_PIXEL_FMT_24BIT;
++		msg.tx_len = 2;
++		r = ctx->dsi->host->ops->transfer(ctx->dsi->host, &msg);
++		if (r < 0)
++			dev_warn(dev, "Failed to set pixel format (prepare): %d\n", r);
++		else
++			dev_info(dev, "Pixel format set to RGB888 (prepare)\n");
++		msleep(10);
++
++		/* Set Display On in LP mode (safe before HS) */
++		msg.type = MIPI_DSI_DCS_SHORT_WRITE;
++		cmd_buf[0] = MIPI_DCS_SET_DISPLAY_ON;
++		msg.tx_len = 1;
++		r = ctx->dsi->host->ops->transfer(ctx->dsi->host, &msg);
++		if (r < 0)
++			dev_warn(dev, "Failed to set display on (prepare): %d\n", r);
++		else
++			dev_info(dev, "Display ON sent (prepare)\n");
++		/* Wait longer to give the panel time to apply settings (some panels
++		 * require >120ms after Exit Sleep to stabilise voltages) */
++		msleep(400);
++
++		/* Try multiple 4-byte LP read attempts to observe active registers.
++		 * Log full hex dump to help diagnose whether communication is alive.
++		 */
++		{
++			int attempt, len = 4;
++			u8 buf[8];
++			int rr;
++
++			for (attempt = 0; attempt < 3; attempt++) {
++				rr = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_POWER_MODE, buf, len);
++				if (rr >= 0) {
++					dev_info(dev, "Power Mode (active) read %d bytes: %*ph\n", rr, rr, buf);
++				} else {
++					dev_warn(dev, "Power Mode read attempt %d failed: %d\n", attempt, rr);
++				}
++				msleep(50);
++			}
++
++			for (attempt = 0; attempt < 3; attempt++) {
++				rr = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_DISPLAY_MODE, buf, len);
++				if (rr >= 0) {
++					dev_info(dev, "Display Mode (active) read %d bytes: %*ph\n", rr, rr, buf);
++				} else {
++					dev_warn(dev, "Display Mode read attempt %d failed: %d\n", attempt, rr);
++				}
++				msleep(50);
++			}
++
++			for (attempt = 0; attempt < 3; attempt++) {
++				rr = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_SIGNAL_MODE, buf, len);
++				if (rr >= 0) {
++					dev_info(dev, "Signal Mode (active) read %d bytes: %*ph\n", rr, rr, buf);
++				} else {
++					dev_warn(dev, "Signal Mode read attempt %d failed: %d\n", attempt, rr);
++				}
++				msleep(50);
++			}
++
++			for (attempt = 0; attempt < 3; attempt++) {
++				rr = mipi_dsi_dcs_read(ctx->dsi, MIPI_DCS_GET_PIXEL_FORMAT, buf, len);
++				if (rr >= 0) {
++					dev_info(dev, "Pixel Format (active) read %d bytes: %*ph\n", rr, rr, buf);
++				} else {
++					dev_warn(dev, "Pixel Format read attempt %d failed: %d\n", attempt, rr);
++				}
++				msleep(50);
++			}
++		}
++	}
++
++	/* Init succeeded - mark as sent and prepared */
++	ctx->init_sent = true;
++	ctx->prepared = true;
++	dev_info(dev, "Init sequence SUCCESS!\n");
++	return 0;
++}
++
++static int ek79007ad3_panel_enable(struct drm_panel *panel)
++{
++	struct ek79007ad3_panel *ctx = to_ek79007ad3_panel(panel);
++	struct mipi_dsi_device *dsi = ctx->dsi;
++	struct device *dev = &dsi->dev;
++	if (ctx->enabled)
++		return 0;
++
++	/* All LP-mode setup (Exit Sleep, Set Pixel Format, Display ON) is
++	 * performed in prepare() so we can perform LP readbacks before HS/video
++	 * mode is activated. Here we only mark the panel as enabled; the VC4
++	 * bridge will enable video mode immediately after.
++	 */
++	ctx->enabled = true;
++	dev_info(dev, "Panel enabled\n");
++	return 0;
++}
++
++static int ek79007ad3_panel_disable(struct drm_panel *panel)
++{
++	struct ek79007ad3_panel *ctx = to_ek79007ad3_panel(panel);
++
++	if (!ctx->enabled)
++		return 0;
++
++	mipi_dsi_dcs_set_display_off(ctx->dsi);
++	msleep(20);
++	mipi_dsi_dcs_enter_sleep_mode(ctx->dsi);
++	msleep(120);
++
++	ctx->enabled = false;
++	return 0;
++}
++
++static int ek79007ad3_panel_unprepare(struct drm_panel *panel)
++{
++	struct ek79007ad3_panel *ctx = to_ek79007ad3_panel(panel);
++
++	if (!ctx->prepared)
++		return 0;
++
++	/* Keep reset HIGH - panel should stay operational
++	 * Only disable enable pin to save power */
++	if (ctx->enable_gpio)
++		gpiod_set_value_cansleep(ctx->enable_gpio, 0);
++
++	/* Reset init_sent flag to allow re-initialization on next prepare */
++	ctx->init_sent = false;
++	ctx->prepared = false;
++	/* Reset prepare counter so next prepare() sequence will skip the
++	 * initial (early) call again, matching the typical DRM/VC4 flow.
++	 */
++	ctx->prepare_count = 0;
++	return 0;
++}
++
++static int ek79007ad3_send_init_sequence(struct ek79007ad3_panel *ctx)
++{
++	struct device *dev = &ctx->dsi->dev;
++	struct mipi_dsi_device *dsi = ctx->dsi;
++	struct mipi_dsi_msg msg;
++	int ret, i;
++
++	/* Manufacturer init sequence - sent in LP mode BEFORE video mode starts */
++	u8 init_seq[][2] = {
++		{0x80, 0x58},  /* R80h: Gamma Control */
++		{0x81, 0x47},  /* R81h: Gamma Control */
++		{0x82, 0xD4},  /* R82h: Gamma Control */
++		{0x83, 0x88},  /* R83h: Gamma Control */
++		{0x84, 0xA9},  /* R84h: Gamma Control */
++		{0x85, 0xC3},  /* R85h: Gamma Control */
++		{0x86, 0x82},  /* R86h: Gamma Control */
++		{0xB0, 0x80},  /* RB0h: PWR_EN=1 - Enable VCOM buffer */
++		{0xB1, 0x00},  /* RB1h: BIST=0 (no test pattern) */
++		{0xB2, 0x40},  /* RB2h: NBW=1 (Normally Black), 4-lane mode (En_3lane=0, En_2lane=0) */
++	};
++
++	dev_info(dev, "Executing GPIO power-on sequence\n");
++
++	/* T0+1ms: Enable STBYB (GPIO17=H) */
++	if (ctx->enable_gpio) {
++		msleep(1);
++		gpiod_set_value_cansleep(ctx->enable_gpio, 1);
++		dev_info(dev, "GPIO17 (Enable/STB) set to: %d (physical state: %s)\n",
++			1, gpiod_get_value(ctx->enable_gpio) ? "HIGH" : "LOW");
++	}
++
++	if (ctx->reset_gpio) {
++		/* Spec extended timing (from directives.md):
++		 * T0: Start LOW (init state) - extended to 100ms for stability
++		 * T0+100ms: HIGH for 150ms (instead of spec 20ms)
++		 * T0+250ms: LOW for 100ms (instead of spec 30ms) = Reset pulse
++		 * T0+350ms: HIGH permanently
++		 * T0+405ms: Send init code (350 + 55ms) */
++		dev_info(dev, "T+0ms: GPIO27 (Reset/GRB) = LOW (initial state)\n");
++		msleep(100);
++
++		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++		dev_info(dev, "T+100ms: GPIO27 (Reset/GRB) = HIGH - Panel running\n");
++		msleep(150);
++
++		gpiod_set_value_cansleep(ctx->reset_gpio, 0);
++		dev_info(dev, "T+250ms: GPIO27 (Reset/GRB) = LOW - Reset pulse\n");
++		msleep(100);
++
++		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++		dev_info(dev, "T+350ms: GPIO27 (Reset/GRB) = HIGH - Panel running (permanent)\n");
++		msleep(55);
++
++		dev_info(dev, "T+405ms: Ready to send Init-Code\n");
++	}
++
++	/* ============================================================================
++	 * CRITICAL: Manufacturer Init Sequence Timing Requirements
++	 * ============================================================================
++	 *
++	 * The manufacturer init sequence (registers 0x80-0x86, 0xB0-0xB2) MUST be
++	 * sent in LP (Low Power) mode BEFORE the DSI controller enters HS video mode.
++	 *
++	 * Why this exact placement is critical:
++	 *
++	 * 1. TIMING REQUIREMENT (from directives.md):
++	 *    "CLK and Data Lanes should keep in LP11(stop state) before GRB"
++	 *    This means: Init registers → LP11 state → Video data (GRB)
++	 *
++	 * 2. VC4 DSI INITIALIZATION SEQUENCE:
++	 *    a) prepare() called early - DSI controller NOT yet initialized
++	 *    b) VC4 initializes DSI host (clocks, PHY, timing registers)
++	 *    c) VC4 callback triggers panel prepare() AGAIN via atomic_pre_enable
++	 *    d) ← WE ARE HERE: DSI ready for LP transfers, video mode NOT started
++	 *    e) enable() called - starts HS video mode via DISP0_CTRL
++	 *
++	 * 3. WHY NOT IN enable():
++	 *    - enable() is called AFTER video mode starts (DISP0_CTRL bit 0 = 1)
++	 *    - Sending manufacturer registers in HS mode violates panel spec
++	 *    - Panel may ignore or misinterpret commands sent during video mode
++	 *    - Results in: Backlight ON but no image (panel not configured)
++	 *
++	 * 4. WHY NOT EARLIER IN prepare():
++	 *    - First prepare() call happens before DSI controller is ready
++	 *    - All register writes timeout with -110 (ETIMEDOUT)
++	 *    - DSI1_STAT = 0x00000000 (controller not initialized)
++	 *
++	 * 5. THE VC4 CALLBACK SOLUTION:
++	 *    - vc4_dsi.c has a callback at end of vc4_dsi_bridge_pre_enable()
++	 *    - It calls downstream bridge's atomic_pre_enable()
++	 *    - This triggers panel prepare() when DSI is ready but video mode off
++	 *    - The init_sent flag prevents duplicate initialization
++	 *
++	 * 6. VERIFICATION:
++	 *    - Check DSI1_STAT register before/after this sequence
++	 *    - Before: 0x00000000 (not ready)
++	 *    - After: 0x55020803 (ready, LP mode, all lanes configured)
++	 *    - Manufacturer registers successfully written (no timeouts)
++	 *    - Panel accepts configuration and displays video data correctly
++	 *
++	 * DO NOT move this code to enable() or earlier in prepare() without
++	 * understanding the complete DSI initialization flow and timing requirements.
++	 * ============================================================================
++	 */
++	dev_info(dev, "Sending Manufacturer Init Sequence (%zu steps) in LP mode\n",
++		ARRAY_SIZE(init_seq));
++
++	msg.channel = dsi->channel;
++	msg.rx_buf = NULL;
++	msg.rx_len = 0;
++	msg.flags = MIPI_DSI_MSG_USE_LPM;
++
++	for (i = 0; i < ARRAY_SIZE(init_seq); i++) {
++		msg.tx_buf = init_seq[i];
++		msg.tx_len = 2;
++		msg.type = MIPI_DSI_GENERIC_SHORT_WRITE_2_PARAM;
++
++		ret = dsi->host->ops->transfer(dsi->host, &msg);
++		if (ret < 0) {
++			dev_warn(dev, "Manufacturer init step %d (reg=0x%02X) failed: %d - DSI not ready\n",
++				i, init_seq[i][0], ret);
++			/* Return error to signal init failed - caller will retry later */
++			return ret;
++		}
++		dev_info(dev, "Manufacturer init step %d OK (reg=0x%02X, val=0x%02X)\n",
++			i, init_seq[i][0], init_seq[i][1]);
++		msleep(2);
++	}
++
++	msleep(50);
++
++	dev_info(dev, "Init sequence completed successfully\n");
++	return 0;
++}
++
++static const struct drm_display_mode default_mode = {
++	.clock = 51200,
++	.hdisplay = 1024,
++	.hsync_start = 1024 + 200, /* HFP increased by +40 */
++	.hsync_end = 1024 + 200 + 70,
++	.htotal = 1024 + 200 + 70 + 200, /* HBP increased by +40 */
++	.vdisplay = 600,
++	.vsync_start = 600 + 12,
++	.vsync_end = 600 + 12 + 10,
++	.vtotal = 600 + 12 + 10 + 23,
++	.width_mm = 154,
++	.height_mm = 86,
++};
++
++static int ek79007ad3_panel_get_modes(struct drm_panel *panel,
++				      struct drm_connector *connector)
++{
++	struct drm_display_mode *mode;
++	u32 bus_format = MEDIA_BUS_FMT_RGB888_1X24;
++
++	mode = drm_mode_duplicate(connector->dev, &default_mode);
++	if (!mode)
++		return -ENOMEM;
++
++	drm_mode_set_name(mode);
++	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
++	connector->display_info.width_mm = mode->width_mm;
++	connector->display_info.height_mm = mode->height_mm;
++	connector->display_info.bpc = 8;  /* 8 bits per component (RGB888) */
++
++	drm_display_info_set_bus_formats(&connector->display_info, &bus_format, 1);
++
++	drm_mode_probed_add(connector, mode);
++
++	return 1;
++}
++
++static const struct drm_panel_funcs ek79007ad3_panel_funcs = {
++	.prepare = ek79007ad3_panel_prepare,
++	.unprepare = ek79007ad3_panel_unprepare,
++	.enable = ek79007ad3_panel_enable,
++	.disable = ek79007ad3_panel_disable,
++	.get_modes = ek79007ad3_panel_get_modes,
++};
++
++static int ek79007ad3_panel_probe(struct mipi_dsi_device *dsi)
++{
++	struct device *dev = &dsi->dev;
++	struct ek79007ad3_panel *ctx;
++	int ret;
++
++	dev_info(dev, "EK79007AD3 panel probe starting\n");
++
++	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	/* Reset GPIO: Active-High in cohob-ovly.dts, init LOW (start in reset) */
++	ctx->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
++				     "Failed to get reset GPIO\n");
++
++	if (ctx->reset_gpio)
++		dev_info(dev, "Got reset GPIO\n");
++	else
++		dev_warn(dev, "No reset GPIO found\n");
++
++	/* Enable GPIO: Active-High, init LOW (disabled) */
++	ctx->enable_gpio = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->enable_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->enable_gpio),
++				     "Failed to get enable GPIO\n");
++
++	if (ctx->enable_gpio)
++		dev_info(dev, "Got enable GPIO\n");
++	else
++		dev_warn(dev, "No enable GPIO found\n");
++
++	ctx->dsi = dsi;
++	mipi_dsi_set_drvdata(dsi, ctx);
++
++	dsi->lanes = 4;
++	dsi->format = MIPI_DSI_FMT_RGB888;
++	/* Laut ASIC-Referenz: Video Mode 0 (Non-burst with sync pulses)
++	 * MIPI_DSI_MODE_VIDEO = Video mode
++	 * MIPI_DSI_MODE_VIDEO_SYNC_PULSE = Sync-pulse video timing (preferred by EK79007)
++	 * MIPI_DSI_MODE_LPM = DCS commands in LP mode */
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
++			  MIPI_DSI_MODE_LPM;
++
++	dev_info(dev, "DSI config: 4 lanes, RGB888, mode_flags=0x%lx\n", dsi->mode_flags);
++
++	drm_panel_init(&ctx->panel, dev, &ek79007ad3_panel_funcs,
++		       DRM_MODE_CONNECTOR_DSI);
++
++	ret = drm_panel_of_backlight(&ctx->panel);
++	if (ret)
++		return ret;
++
++	/* Add panel to DRM BEFORE attaching to DSI so drmm_of_get_bridge can find it */
++	drm_panel_add(&ctx->panel);
++
++	/* Create panel bridge - this allows DSI host to find us */
++	ctx->bridge = drm_panel_bridge_add(&ctx->panel);
++	if (IS_ERR(ctx->bridge)) {
++		dev_err(dev, "Failed to create panel bridge: %ld\n", PTR_ERR(ctx->bridge));
++		drm_panel_remove(&ctx->panel);
++		return PTR_ERR(ctx->bridge);
++	}
++	dev_info(dev, "Panel bridge created\n");
++
++	ret = mipi_dsi_attach(dsi);
++	if (ret < 0) {
++		dev_err(dev, "Failed to attach to DSI host: %d\n", ret);
++		drm_panel_bridge_remove(ctx->bridge);
++		drm_panel_remove(&ctx->panel);
++		return ret;
++	}
++
++	dev_info(dev, "EK79007AD3 panel probe complete - panel initialized but video mode deferred to DRM\n");
++	return 0;
++}
++
++static void ek79007ad3_panel_remove(struct mipi_dsi_device *dsi)
++{
++	struct ek79007ad3_panel *ctx = mipi_dsi_get_drvdata(dsi);
++
++	mipi_dsi_detach(dsi);
++	drm_panel_bridge_remove(ctx->bridge);
++	drm_panel_remove(&ctx->panel);
++}
++
++static const struct of_device_id ek79007ad3_of_match[] = {
++	{ .compatible = "ek79007ad3,fn0700d086a" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, ek79007ad3_of_match);
++
++static struct mipi_dsi_driver ek79007ad3_panel_driver = {
++	.probe = ek79007ad3_panel_probe,
++	.remove = ek79007ad3_panel_remove,
++	.driver = {
++		.name = "panel-ek79007ad3",
++		.of_match_table = ek79007ad3_of_match,
++	},
++};
++module_mipi_dsi_driver(ek79007ad3_panel_driver);
++
++MODULE_AUTHOR("CoHoB");
++MODULE_DESCRIPTION("DRM driver for EK79007AD3-based DSI panel");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/vc4/vc4_drv.c b/drivers/gpu/drm/vc4/vc4_drv.c
+index 55879b5f36ae..b263362fc50d 100644
+--- a/drivers/gpu/drm/vc4/vc4_drv.c
++++ b/drivers/gpu/drm/vc4/vc4_drv.c
+@@ -269,16 +269,27 @@ static void vc4_match_add_drivers(struct device *dev,
+ {
+ 	int i;
+ 
++	dev_info(dev, "vc4_match_add_drivers: Searching for %d component drivers\n", count);
++
+ 	for (i = 0; i < count; i++) {
+ 		struct device_driver *drv = &drivers[i]->driver;
+ 		struct device *p = NULL, *d;
++		int found = 0;
+ 
+ 		while ((d = platform_find_device_by_driver(p, drv))) {
+ 			put_device(p);
++			dev_info(dev, "vc4_match_add_drivers: Found device '%s' for driver '%s'\n",
++				 dev_name(d), drv->name);
+ 			component_match_add(dev, match, component_compare_dev, d);
+ 			p = d;
++			found++;
+ 		}
+ 		put_device(p);
++
++		if (found == 0) {
++			dev_info(dev, "vc4_match_add_drivers: No devices found for driver '%s'\n",
++				 drv->name);
++		}
+ 	}
+ }
+ 
+@@ -323,6 +334,8 @@ static int vc4_drm_bind(struct device *dev)
+ 	enum vc4_gen gen;
+ 	int ret = 0;
+ 
++	dev_info(dev, "vc4_drm_bind: Starting bind\n");
++
+ 	dev->coherent_dma_mask = DMA_BIT_MASK(32);
+ 
+ 	gen = (enum vc4_gen)of_device_get_match_data(dev);
+@@ -402,6 +415,7 @@ static int vc4_drm_bind(struct device *dev)
+ 	}
+ 
+ 	ret = component_bind_all(dev, drm);
++	dev_info(dev, "vc4_drm_bind: component_bind_all returned %d\n", ret);
+ 	if (ret)
+ 		goto err;
+ 
+@@ -428,7 +442,7 @@ static int vc4_drm_bind(struct device *dev)
+ 	if (ret < 0)
+ 		goto err;
+ 
+-	drm_fbdev_dma_setup(drm, 16);
++	drm_fbdev_dma_setup(drm, 24);
+ 
+ 	return 0;
+ 
+@@ -476,11 +490,21 @@ static int vc4_platform_drm_probe(struct platform_device *pdev)
+ {
+ 	struct component_match *match = NULL;
+ 	struct device *dev = &pdev->dev;
++	int ret;
++
++	dev_info(dev, "vc4_platform_drm_probe: Starting probe\n");
+ 
+ 	vc4_match_add_drivers(dev, &match,
+ 			      component_drivers, ARRAY_SIZE(component_drivers));
+ 
+-	return component_master_add_with_match(dev, &vc4_drm_ops, match);
++	dev_info(dev, "vc4_platform_drm_probe: Calling component_master_add_with_match\n");
++	ret = component_master_add_with_match(dev, &vc4_drm_ops, match);
++	if (ret)
++		dev_err(dev, "vc4_platform_drm_probe: component_master_add_with_match failed: %d\n", ret);
++	else
++		dev_info(dev, "vc4_platform_drm_probe: Success\n");
++
++	return ret;
+ }
+ 
+ static void vc4_platform_drm_remove(struct platform_device *pdev)
+diff --git a/drivers/gpu/drm/vc4/vc4_dsi.c b/drivers/gpu/drm/vc4/vc4_dsi.c
+index 6c239ab36965..9786e973de72 100644
+--- a/drivers/gpu/drm/vc4/vc4_dsi.c
++++ b/drivers/gpu/drm/vc4/vc4_dsi.c
+@@ -923,7 +923,7 @@ static void vc4_dsi_bridge_pre_enable(struct drm_bridge *bridge,
+ 	struct device *dev = &dsi->pdev->dev;
+ 	const struct drm_display_mode *mode;
+ 	struct drm_connector *connector;
+-	bool debug_dump_regs = false;
++	bool debug_dump_regs = true;
+ 	unsigned long hs_clock;
+ 	struct drm_crtc *crtc;
+ 	u32 ui_ns;
+@@ -1187,6 +1187,53 @@ static void vc4_dsi_bridge_pre_enable(struct drm_bridge *bridge,
+ 		DSI_PORT_WRITE(DISP0_CTRL,
+ 			       DSI_DISP0_COMMAND_MODE);
+ 	}
++
++	/* CRITICAL FIX: Call downstream bridge (panel) pre_enable HERE,
++	 * after DSI host is fully initialized and ready for LP transfers,
++	 * but BEFORE video mode starts in bridge_enable().
++	 * This allows the panel to send init sequences in LP mode.
++	 *
++	 * We call the panel's exported init function directly to bypass
++	 * the standard prepare() which is called too early (before DSI ready).
++	 */
++	dev_info(&dsi->pdev->dev, "VC4 DSI host ready - calling panel init\n");
++	if (dsi->out_bridge) {
++		extern int ek79007ad3_panel_send_init(struct drm_panel *panel);
++		u32 saved_disp0;
++
++		/* Try to get panel from bridge */
++		if (dsi->out_bridge->funcs && dsi->out_bridge->funcs->get_modes) {
++			/* This is likely a panel bridge - try to extract panel */
++			dev_info(&dsi->pdev->dev, "Found bridge with get_modes - attempting panel init\n");
++
++			/* Ensure the controller is in an LP/command-safe state before
++			 * calling the panel's pre-enable/init. Some panels require init
++			 * sequences to be sent in LP mode before video mode is enabled.
++			 * Temporarily force Command Mode (without enabling video) so the
++			 * panel can receive LP transfers reliably. Restore the previous
++			 * DISP0_CTRL afterwards.
++			 */
++			saved_disp0 = DSI_PORT_READ(DISP0_CTRL);
++			/* Clear ENABLE bit and set COMMAND_MODE to be explicitly safe */
++			DSI_PORT_WRITE(DISP0_CTRL, (saved_disp0 & ~DSI_DISP0_ENABLE) | DSI_DISP0_COMMAND_MODE);
++
++			/* Call the standard atomic_pre_enable if provided - this will
++			 * call panel->prepare() at the correct time when DSI is ready.
++			 */
++			if (dsi->out_bridge->funcs->atomic_pre_enable) {
++				dev_info(&dsi->pdev->dev, "Calling bridge pre_enable (LP/command-safe)\n");
++				dsi->out_bridge->funcs->atomic_pre_enable(dsi->out_bridge, old_state);
++				dev_info(&dsi->pdev->dev, "Bridge pre_enable done\n");
++			}
++
++			/* Restore previous DISP0_CTRL configuration (video will be
++			 * actually enabled later in bridge_enable()).
++			 */
++			DSI_PORT_WRITE(DISP0_CTRL, saved_disp0);
++		}
++	} else {
++		dev_info(&dsi->pdev->dev, "No downstream bridge\n");
++	}
+ }
+ 
+ static void vc4_dsi_bridge_enable(struct drm_bridge *bridge,
+@@ -1195,10 +1242,21 @@ static void vc4_dsi_bridge_enable(struct drm_bridge *bridge,
+ 	struct vc4_dsi *dsi = bridge_to_vc4_dsi(bridge);
+ 	bool debug_dump_regs = false;
+ 	u32 disp0_ctrl;
++    u32 disp1_ctrl;
+ 
+ 	disp0_ctrl = DSI_PORT_READ(DISP0_CTRL);
++	/* Ensure pixel FIFO format is 24-bit RGB888 for port 1 */
++	disp1_ctrl = DSI_PORT_READ(DISP1_CTRL);
++	disp1_ctrl &= ~DSI_DISP1_PFORMAT_MASK;
++	disp1_ctrl |= DSI1_DISP1_PFORMAT_24BIT;
++	DSI_PORT_WRITE(DISP1_CTRL, disp1_ctrl);
++	dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_enable: DISP1_CTRL set to 0x%08x (24-bit)\n", disp1_ctrl);
++	/* Allow LP-STOP during HFP/HBP (remove forced blanking packets) */
++	disp0_ctrl &= ~(DSI_DISP_HFP_CTRL | DSI_DISP_HBP_CTRL);
++	dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_enable: DISP0_CTRL before = 0x%08x\n", disp0_ctrl);
+ 	disp0_ctrl |= DSI_DISP0_ENABLE;
+ 	DSI_PORT_WRITE(DISP0_CTRL, disp0_ctrl);
++	dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_enable: DISP0_CTRL after = 0x%08x (video mode active)\n", disp0_ctrl);
+ 
+ 	if (debug_dump_regs) {
+ 		struct drm_printer p = drm_info_printer(&dsi->pdev->dev);
+@@ -1211,10 +1269,36 @@ static int vc4_dsi_bridge_attach(struct drm_bridge *bridge,
+ 				 enum drm_bridge_attach_flags flags)
+ {
+ 	struct vc4_dsi *dsi = bridge_to_vc4_dsi(bridge);
++	struct drm_device *drm = dsi->bridge.dev;
++	int ret;
++
++	dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_attach: Attaching DSI bridge\n");
++
++	/* Try to get panel bridge - panel should be registered by now */
++	if (!dsi->out_bridge) {
++		dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_attach: Getting panel bridge from device tree\n");
++		dsi->out_bridge = drmm_of_get_bridge(drm, dsi->pdev->dev.of_node, 0, 0);
++		if (IS_ERR(dsi->out_bridge)) {
++			ret = PTR_ERR(dsi->out_bridge);
++			dev_err(&dsi->pdev->dev, "Failed to get panel bridge: %d\n", ret);
++			dsi->out_bridge = NULL;
++			return ret;
++		}
++		dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_attach: Got panel bridge\n");
++	}
++
++	/* Attach panel bridge to encoder */
++	if (dsi->out_bridge) {
++		dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_attach: Attaching panel bridge to encoder\n");
++		ret = drm_bridge_attach(bridge->encoder, dsi->out_bridge, &dsi->bridge, flags);
++		if (ret) {
++			dev_err(&dsi->pdev->dev, "Failed to attach panel bridge: %d\n", ret);
++			return ret;
++		}
++		dev_info(&dsi->pdev->dev, "vc4_dsi_bridge_attach: Panel bridge attached successfully!\n");
++	}
+ 
+-	/* Attach the panel or bridge to the dsi bridge */
+-	return drm_bridge_attach(bridge->encoder, dsi->out_bridge,
+-				 &dsi->bridge, flags);
++	return 0;
+ }
+ 
+ static ssize_t vc4_dsi_transfer(struct vc4_dsi *dsi,
+@@ -1336,6 +1420,10 @@ static ssize_t vc4_dsi_transfer(struct vc4_dsi *dsi,
+ 	}
+ 
+ 	/* Send the packet. */
++	if (msg->flags & MIPI_DSI_MSG_USE_LPM) {
++		dev_info(&dsi->pdev->dev, "Sending packet in LP mode: type=0x%02x, len=%zu, pktc=0x%08x\n",
++			 msg->type, msg->tx_len, pktc);
++	}
+ 	DSI_PORT_WRITE(TXPKT1H, pkth);
+ 	DSI_PORT_WRITE(TXPKT1C, pktc);
+ 
+@@ -1441,7 +1529,9 @@ static int vc4_dsi_host_attach(struct mipi_dsi_host *host,
+ 			       struct mipi_dsi_device *device)
+ {
+ 	struct vc4_dsi *dsi = host_to_dsi(host);
+-	int ret;
++
++	dev_info(&dsi->pdev->dev, "vc4_dsi_host_attach: Panel attaching (lanes=%d, format=%d, mode_flags=0x%lx)\n",
++		 device->lanes, device->format, device->mode_flags);
+ 
+ 	dsi->lanes = device->lanes;
+ 	dsi->channel = device->channel;
+@@ -1476,14 +1566,7 @@ static int vc4_dsi_host_attach(struct mipi_dsi_host *host,
+ 		return 0;
+ 	}
+ 
+-	drm_bridge_add(&dsi->bridge);
+-
+-	ret = component_add(&dsi->pdev->dev, &vc4_dsi_ops);
+-	if (ret) {
+-		drm_bridge_remove(&dsi->bridge);
+-		return ret;
+-	}
+-
++	dev_info(&dsi->pdev->dev, "vc4_dsi_host_attach: Panel attach complete\n");
+ 	return 0;
+ }
+ 
+@@ -1761,6 +1844,8 @@ static int vc4_dsi_bind(struct device *dev, struct device *master, void *data)
+ 	struct drm_encoder *encoder = &dsi->encoder.base;
+ 	int ret;
+ 
++	dev_info(dev, "vc4_dsi_bind: Starting bind for %s\n", dev_name(dev));
++
+ 	vc4_dsi_get(dsi);
+ 
+ 	ret = drmm_add_action_or_reset(drm, vc4_dsi_release_action, dsi);
+@@ -1878,8 +1963,16 @@ static int vc4_dsi_bind(struct device *dev, struct device *master, void *data)
+ 	}
+ 
+ 	dsi->out_bridge = drmm_of_get_bridge(drm, dev->of_node, 0, 0);
+-	if (IS_ERR(dsi->out_bridge))
+-		return PTR_ERR(dsi->out_bridge);
++	if (IS_ERR(dsi->out_bridge)) {
++		ret = PTR_ERR(dsi->out_bridge);
++		if (ret == -EPROBE_DEFER) {
++			dev_info(dev, "vc4_dsi_bind: Panel not ready yet, will be attached later via MIPI DSI\n");
++			dsi->out_bridge = NULL; /* Panel will attach later */
++		} else {
++			dev_err(dev, "vc4_dsi_bind: drmm_of_get_bridge failed: %d\n", ret);
++			return ret;
++		}
++	}
+ 
+ 	/* The esc clock rate is supposed to always be 100Mhz. */
+ 	ret = clk_set_rate(dsi->escape_clock, 100 * 1000000);
+@@ -1888,6 +1981,14 @@ static int vc4_dsi_bind(struct device *dev, struct device *master, void *data)
+ 		return ret;
+ 	}
+ 
++	/* Enable escape clock early so panel can send init commands in LP mode */
++	ret = clk_prepare_enable(dsi->escape_clock);
++	if (ret) {
++		dev_err(dev, "Failed to enable escape clock: %d\n", ret);
++		return ret;
++	}
++	dev_info(dev, "vc4_dsi_bind: Escape clock enabled for LP mode transfers\n");
++
+ 	ret = vc4_dsi_init_phy_clocks(dsi);
+ 	if (ret)
+ 		return ret;
+@@ -1919,6 +2020,8 @@ static int vc4_dsi_dev_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct vc4_dsi *dsi;
+ 
++	dev_info(dev, "vc4_dsi_dev_probe: Starting probe for %s\n", dev_name(dev));
++
+ 	dsi = kzalloc(sizeof(*dsi), GFP_KERNEL);
+ 	if (!dsi)
+ 		return -ENOMEM;
+@@ -1936,7 +2039,9 @@ static int vc4_dsi_dev_probe(struct platform_device *pdev)
+ 	dsi->dsi_host.dev = dev;
+ 	mipi_dsi_host_register(&dsi->dsi_host);
+ 
+-	return 0;
++	dev_info(dev, "vc4_dsi_dev_probe: MIPI DSI host registered, adding as component\n");
++
++	return component_add(&pdev->dev, &vc4_dsi_ops);
+ }
+ 
+ static void vc4_dsi_dev_remove(struct platform_device *pdev)
+-- 
+2.43.0
+

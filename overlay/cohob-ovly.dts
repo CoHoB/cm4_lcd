@@ -1,0 +1,57 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&dsi1>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port {
+				dsi1_out: endpoint {
+					remote-endpoint = <&panel_dsi_in>;
+				};
+			};
+
+			cohob_panel: panel@0 {
+				compatible = "ek79007ad3,fn0700d086a";
+				reg = <0>;
+				reset-gpios = <&gpio 27 0>;
+				enable-gpios = <&gpio 17 0>;
+				pinctrl-0 = <&cohob_pins>;
+				pinctrl-names = "default";
+				/*bist-enable;*/
+
+				port {
+					panel_dsi_in: endpoint {
+						remote-endpoint = <&dsi1_out>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&gpio>;
+		__overlay__ {
+			cohob_pins: cohob_pins {
+				brcm,pins = <17 27>;
+				brcm,function = <1 1>;  /* Output */
+				brcm,pull = <0 1>;      /* GPIO17: no pull, GPIO27: pull-down */
+			};
+		};
+	};
+
+	__overrides__ {
+		enable = <&cohob_pins>,"brcm,pins:0", <&cohob_panel>,"enable-gpios:4";
+		reset = <&cohob_pins>,"brcm,pins:1", <&cohob_panel>,"reset-gpios:4";
+		enable_pol = <&cohob_panel>,"enable-gpios:8";
+		reset_pol = <&cohob_panel>,"reset-gpios:8";
+	};
+};
+
+
